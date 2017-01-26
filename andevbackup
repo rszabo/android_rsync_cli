@@ -1,0 +1,242 @@
+#!/bin/bash
+#
+# Use rsync to copy data from your Android powered device.
+#
+# @file      andevbackup
+# @author    Richard K. Szabó <richard@9eb.se>
+# @date      Thu Jan 26 23:10:06 2017
+# @created   Mon Jan  9 19:44:30 2017
+# @license   MIT
+# @todo      Implement the ability to choose device if several exist. (adb devices -l)
+# @todo      ...
+
+# CONFIGURATION {{{
+[ "$TMPDIR" = "" ] && export TMPDIR="/tmp";   # Set temporary directory if missing
+program_full=$0
+program="`basename $program_full`"
+param=$1
+backup_permitted_lock=".allow_backup"         # Lock-file which must exist in local backup dir.
+ip_local="127.0.0.1"                          #
+port_local=6010                               # Port on client device
+port_remote=1873                              # Port on phone/mobile device.
+rsync_chroot="/sdcard/"                       # Define "root" directory (try /sdcard/Pictures)
+rsync_bin="rsync"                             # Name of binary to copy to device
+rsync_remote_path="/data/local/tmp"           # Destination of rsync binary on device
+rsyncdconf_path="$TMPDIR/rsyncd.conf"         #
+pid="$$"                                      # Current pid
+pid_file_main="$TMPDIR/$program-main.pid"     # See write_pid_main()
+pid_file_copy="$TMPDIR/$program-copy.pid"     # See write_pid_copy()
+dependencies=( adb rsync sed cat wget ps du ) # Dependencies to use this script
+
+# }}}
+
+# FUNCTIONS {{{
+
+# This function will test the availability of required tools.
+function test_dependencies() {
+  for d in $dependencies; do
+    [ ! -f "`which $d`" ] && throw_error 1 "Required tool $d missing.";
+  done
+}
+
+function is_adb_rsync_running() {
+  res="`ps u|grep adb|grep \/$rsync_bin`"
+  [ "$res" != "" ] && echo 1
+}
+
+function get_dir_size() {
+  du -sh . |sed 's/[[:blank:]]//g'
+}
+
+function get_rsync_bin() {
+  if [ ! -f "$TMPDIR/$rsync_bin" ]; then
+    process_task \
+      "wget https://github.com/pts/rsyncbin/raw/master/rsync.rsync4android -O $TMPDIR/$rsync_bin" \
+      "Failed to download $rsync_bin"
+  fi
+}
+
+function write_pid_main() {
+  echo $pid >$pid_file_main
+  throw_error $? "Unable to write main program PID to $pid_file_main"
+}
+
+function read_pid_main() {
+  [ -f "$pid_file_main" ] && cat $pid_file_main;
+}
+
+function remove_pid_main() {
+  [ -f "$pid_file_main" ] && rm -Rf $pid_file_main;
+}
+
+function write_pid_copy() {
+  echo $pid >$pid_file_copy
+  throw_error $? "Unable to write copy program PID to $pid_file_copy"
+}
+
+function read_pid_copy() {
+  [ -f "$pid_file_copy" ] && cat $pid_file_copy;
+}
+
+function remove_pid_copy() {
+  [ -f "$pid_file_copy" ] && rm -Rf $pid_file_copy;
+}
+
+# Function which takes care of the copying process. Called on by instance with parameter --copy.
+function run_copy() {
+
+  [ "$(read_pid_main)" = "" ] && throw_error 1 "Main program is not running, aborting.";
+  [ "$(read_pid_copy)" != "" ] && throw_error 1 "Copy already running, aborting.";
+
+  write_pid_copy;
+
+  echo "Waiting for rsync to respond..."
+  while (true); do
+    echo -n "."
+    [ "$(is_adb_rsync_running)" = "1" ] && break;
+    sleep 1
+  done
+
+  process_task "rsync -av --size-only rsync://$ip_local:$port_local/root/ ." "Failed to copy"
+
+  remove_pid_copy;
+
+  echo "COPY: Completed with pid #$pid."
+}
+
+# A function which kills the main process, called on by instance with parameter "--copy".
+function terminate_main() {
+
+  pid_value_main=$(read_pid_main);
+  [ "$pid_value_main" = "" ] && throw_error 1 "$program PID not registered, see $pid_file_main";
+
+  remove_pid_main;
+
+  kill $pid_value_main
+  echo "MAIN: Killed main script with exit code #$?"
+}
+
+# Assembles a configuration file for rsyncd and uploads it.
+function parse_and_upload_rsyncdconf() {
+
+  echo "Configuring $rsyncdconf_path"
+
+  cat << EOF > $rsyncdconf_path
+address = $ip_local
+port = $port_remote
+[root]
+path = $rsync_chroot
+use chroot = false
+read only = false
+EOF
+
+  [ ! -f "$rsyncdconf_path" ] && echo "ERROR: File $rsyncdconf_path never written." && exit 1;
+
+  # Upload configuration
+  adb push $rsyncdconf_path /sdcard/`basename $rsyncdconf_path`
+  throw_error $? "Failed to copy $rsyncdconf_path to /sdcard/"
+
+  rm -Rf $rsyncdconf_path
+}
+
+# Throws error message $2 if $1 is non-zero.
+# @param $1 Error Code
+# @param $2 Error Message
+function throw_error() {
+
+  if [ "$1" -ne 0 ]; then
+    echo "<!!> ERROR: $2"
+    remove_pid_main && remove_pid_copy && exit $1;
+  fi
+}
+
+# @param $1 Command to execute
+# @param $2 Error message to include on failure
+function process_task() {
+
+  echo "Executing: $1"
+  $1
+  throw_error $? "$2"
+}
+
+# }}}
+
+#                                                                 #
+#                        --- PROGRAM LOGIC ---                    #
+#                                                                 #
+
+test_dependencies;
+
+# Better safe than sorry: Prevents copying device contents to unintentional locations.
+[ ! -f "$backup_permitted_lock" ] && \
+  throw_error 1 "To backup to this dir. you must create a file called $backup_permitted_lock";
+
+# Basic write test
+touch $backup_permitted_lock;
+throw_error $? "Aborting. Check directory permissions of `pwd`."
+
+# Called on by self to begin copying when data source is available
+if [ "$param" = "--copy" ]; then
+  echo -n "--copy: ";
+  run_copy;
+  terminate_main;
+  exit 0
+fi
+
+echo "Android Device Backup"
+echo "---"
+
+# Already running?
+[ "$(read_pid_main)" != "" ] && \
+  throw_error 1 "Already registered with pid #$(read_pid_main) in $pid_file_main.";
+
+# Write main pid file
+write_pid_main;
+
+# Get rsync binary for device, if missing
+get_rsync_bin;
+
+echo "MAIN: Connecting to device..."
+
+# Check version and existence of rsync.
+rsync_version="`adb shell $rsync_remote_path/$rsync_bin --version`"
+if [ "$?" -ne 0 ]; then
+  process_task \
+    "adb push $TMPDIR/$rsync_bin $rsync_remote_path/$rsync_bin" \
+    "Failed to upload $rsync_bin"
+fi
+
+parse_and_upload_rsyncdconf;
+
+# @todo Should check if already running.
+process_task "adb forward tcp:$port_local tcp:$port_remote" "Failed to setup port forwarding"
+
+echo "MAIN: Starting local rsync in wait mode"
+time $program_full --copy &
+
+echo "MAIN: Starting remote rsync on your device"
+
+if [ "$(is_adb_rsync_running)" = "" ]; then
+  adb shell "$rsync_remote_path/$rsync_bin \
+    --daemon --no-detach --config=/sdcard/rsyncd.conf --log-file=/proc/self/fd/2"
+
+  throw_error $? "adb rsync failed to start on your device!"
+else
+  # Stall briefly for the copy instance to catch up.
+  sleep 1 && echo "" && echo "Connecting to already running rsync server...";
+fi
+
+# Wait here until copy is complete.
+while (true); do
+
+  echo -n "."
+  [ "$(read_pid_copy)" = "" ] && break;
+  sleep 1
+done
+
+remove_pid_main;
+
+echo "Total size of backup: $(get_dir_size)"
+echo "Done: $program (#$pid) completed."
+
+# vim:foldmethod=marker:foldmarker={{{,}}}:foldlevel=0:colorcolumn=100:textwidth=100
