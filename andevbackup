@@ -4,10 +4,11 @@
 #
 # @file      andevbackup
 # @author    Richard K. Szabó <richard@9eb.se>
-# @date      Thu Jan 26 23:10:06 2017
+# @date      Fri Jan 27 09:00:50 2017
 # @created   Mon Jan  9 19:44:30 2017
 # @license   MIT
 # @todo      Implement the ability to choose device if several exist. (adb devices -l)
+# @todo      Exit while loops which have been running for X seconds (b0rk fix)
 # @todo      ...
 
 # CONFIGURATION {{{
@@ -116,8 +117,19 @@ function terminate_main() {
   echo "MAIN: Killed main script with exit code #$?"
 }
 
-# Assembles a configuration file for rsyncd and uploads it.
+# Assembles a configuration file for rsync and uploads it.
 function parse_and_upload_rsyncdconf() {
+
+  # Check version and existence of rsync.
+  rsync_version="`adb shell $rsync_remote_path/$rsync_bin --version`"
+  if [ "$?" -ne 0 ]; then
+    process_task \
+      "adb push $TMPDIR/$rsync_bin $rsync_remote_path/$rsync_bin" \
+      "Failed to upload $rsync_bin";
+    process_task \
+      "adb shell chmod 755 $rsync_remote_path/$rsync_bin" \
+      "Failed to chmod $rsync_bin";
+  fi
 
   echo "Configuring $rsyncdconf_path"
 
@@ -130,7 +142,7 @@ use chroot = false
 read only = false
 EOF
 
-  [ ! -f "$rsyncdconf_path" ] && echo "ERROR: File $rsyncdconf_path never written." && exit 1;
+  [ ! -f "$rsyncdconf_path" ] && throw_error 1 "File $rsyncdconf_path never written.";
 
   # Upload configuration
   adb push $rsyncdconf_path /sdcard/`basename $rsyncdconf_path`
@@ -143,7 +155,6 @@ EOF
 # @param $1 Error Code
 # @param $2 Error Message
 function throw_error() {
-
   if [ "$1" -ne 0 ]; then
     echo "<!!> ERROR: $2"
     remove_pid_main && remove_pid_copy && exit $1;
@@ -153,7 +164,6 @@ function throw_error() {
 # @param $1 Command to execute
 # @param $2 Error message to include on failure
 function process_task() {
-
   echo "Executing: $1"
   $1
   throw_error $? "$2"
@@ -197,14 +207,6 @@ write_pid_main;
 get_rsync_bin;
 
 echo "MAIN: Connecting to device..."
-
-# Check version and existence of rsync.
-rsync_version="`adb shell $rsync_remote_path/$rsync_bin --version`"
-if [ "$?" -ne 0 ]; then
-  process_task \
-    "adb push $TMPDIR/$rsync_bin $rsync_remote_path/$rsync_bin" \
-    "Failed to upload $rsync_bin"
-fi
 
 parse_and_upload_rsyncdconf;
 
